@@ -85,7 +85,7 @@ class UltimateRAG:
 
     def create_embeddings(self):
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-mpnet-base-v2"
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
 
     def build_and_save_index(self):
