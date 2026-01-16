@@ -3,10 +3,12 @@ services:
     name: hybrid-chatbot
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.7
       - key: GROQ_API_KEY
-        sync: false  # Set manually in Render dashboard
+        sync: false
