@@ -2,33 +2,27 @@ from flask import Flask, render_template, request, jsonify
 from rag_pipeline import UltimateRAG
 import os
 from dotenv import load_dotenv
-import traceback  # NEW - for detailed error tracking
+import traceback
+import gc  # Garbage collection
 
-# Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__)
 
-# ==========================
 # Configuration
-# ==========================
 EXCEL_PATH = "NLP_QA_Pairs12.xlsx"
 PDF_DIR = "pdfs"
 INDEX_PATH = "faiss_index"
-
-# Get API key from environment variable
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
-    raise RuntimeError("❌ GROQ_API_KEY not set. Create a .env file with your API key.")
+    raise RuntimeError("❌ GROQ_API_KEY not set")
 
-# ==========================
-# Initialize RAG (Lazy Loading)
-# ==========================
+# Don't initialize RAG at startup
 rag = None
 
 def get_rag():
-    """Lazy load RAG to reduce memory usage"""
+    """Lazy load RAG only when needed"""
     global rag
     if rag is None:
         print("🚀 Initializing RAG pipeline...")
@@ -39,12 +33,11 @@ def get_rag():
             api_key=GROQ_API_KEY
         )
         rag.build()
+        # Force garbage collection
+        gc.collect()
         print("✅ RAG pipeline ready")
     return rag
 
-# ==========================
-# Routes
-# ==========================
 @app.route("/")
 def home():
     return render_template("index.html")
@@ -58,23 +51,24 @@ def chat():
         return jsonify({"answer": "Please enter a valid question."})
 
     try:
-        print(f"📥 Question received: {question}")  # NEW - log question
+        print(f"📥 Question: {question}")
         rag_instance = get_rag()
-        print("🔍 Processing with RAG...")  # NEW
         answer = rag_instance.ask(question)
-        print(f"✅ Answer generated: {answer[:100]}...")  # NEW - log first 100 chars
+        
+        # Clear memory after response
+        gc.collect()
+        
         return jsonify({"answer": answer})
     except Exception as e:
-        # Print full error traceback
         error_details = traceback.format_exc()
-        print(f"❌ Error occurred:\n{error_details}")  # NEW - detailed error
+        print(f"❌ Error:\n{error_details}")
         return jsonify({"answer": f"⚠️ Error: {str(e)}"}), 500
 
 @app.route("/health")
 def health():
-    """Health check endpoint for Render"""
     return jsonify({"status": "healthy"}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)  # Added debug=True
+    # Remove debug=True in production
+    app.run(host="0.0.0.0", port=port, debug=False)

@@ -2,16 +2,13 @@ import os
 import pandas as pd
 from groq import Groq
 import traceback
-import shutil  # NEW
+import shutil
+import gc
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-
-# ============================================================
-# 📊 EXCEL Q&A PROCESSOR
-# ============================================================
 
 class ExcelQAProcessor:
     def __init__(self, excel_path):
@@ -31,10 +28,13 @@ class ExcelQAProcessor:
                 a = str(row["Answer"]).strip()
                 self.qa_pairs[q] = a
 
+            # Clear DataFrame from memory
+            del df
+            gc.collect()
+
             print(f"✅ Loaded {len(self.qa_pairs)} Excel Q&A pairs")
         except Exception as e:
             print(f"❌ Error loading Excel: {str(e)}")
-            print(traceback.format_exc())
             raise
 
     def get_answer(self, question):
@@ -53,16 +53,11 @@ class ExcelQAProcessor:
                     print(f"✅ Found partial match in Excel")
                     return True, self.qa_pairs[k]
 
-            print(f"ℹ️  No match in Excel, using RAG")
             return False, ""
         except Exception as e:
             print(f"❌ Error in Excel search: {str(e)}")
             return False, ""
 
-
-# ============================================================
-# 🧠 ULTIMATE RAG
-# ============================================================
 
 class UltimateRAG:
     def __init__(self, pdf_directory, index_path, excel_path, api_key):
@@ -74,26 +69,27 @@ class UltimateRAG:
         self.excel_processor = ExcelQAProcessor(excel_path)
         self.vectorstore = None
         self.retriever = None
+        self.embeddings = None
 
     def build(self):
-        """Build RAG pipeline"""
+        """Build RAG pipeline with memory optimization"""
         try:
             print("📊 Loading Excel Q&A pairs...")
             self.excel_processor.load_qa_pairs()
             
-            # Create embeddings first
+            # Create embeddings
             self.create_embeddings()
             
-            # Check if index exists and is compatible
+            # Check if index exists
             if os.path.exists(self.index_path):
-                print("📂 Found existing FAISS index, checking compatibility...")
+                print("📂 Found existing FAISS index...")
                 try:
                     self.load_index()
-                    print("✅ Existing index is compatible")
-                except (AssertionError, Exception) as e:
-                    print(f"⚠️  Existing index incompatible: {str(e)}")
+                    print("✅ Existing index loaded")
+                except Exception as e:
+                    print(f"⚠️ Index incompatible: {str(e)}")
                     print("🔄 Rebuilding FAISS index...")
-                    shutil.rmtree(self.index_path)  # Delete old index
+                    shutil.rmtree(self.index_path)
                     self.load_documents()
                     self.split_documents()
                     self.build_and_save_index()
@@ -108,11 +104,10 @@ class UltimateRAG:
             print("✅ RAG build complete")
         except Exception as e:
             print(f"❌ Error building RAG: {str(e)}")
-            print(traceback.format_exc())
             raise
 
     def load_documents(self):
-        """Load PDF documents"""
+        """Load PDF documents with memory cleanup"""
         try:
             self.documents = []
 
@@ -126,33 +121,41 @@ class UltimateRAG:
 
             print(f"📄 Found {len(pdf_files)} PDF files")
 
+            # Load PDFs one by one and clear memory
             for file in pdf_files:
                 print(f"  Loading: {file}")
                 loader = PyPDFLoader(os.path.join(self.pdf_directory, file))
-                self.documents.extend(loader.load())
+                docs = loader.load()
+                self.documents.extend(docs)
+                
+                # Clear loader from memory
+                del loader, docs
+                gc.collect()
 
             print(f"✅ Loaded {len(self.documents)} PDF pages")
         except Exception as e:
             print(f"❌ Error loading documents: {str(e)}")
-            print(traceback.format_exc())
             raise
 
     def split_documents(self):
-        """Split documents into chunks"""
+        """Split documents into smaller chunks"""
         try:
             splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200
+                chunk_size=800,  # Reduced from 1000
+                chunk_overlap=150  # Reduced from 200
             )
             self.chunks = splitter.split_documents(self.documents)
-            print(f"✂️  Created {len(self.chunks)} chunks")
+            print(f"✂️ Created {len(self.chunks)} chunks")
+            
+            # Clear documents after chunking
+            del self.documents
+            gc.collect()
         except Exception as e:
             print(f"❌ Error splitting documents: {str(e)}")
-            print(traceback.format_exc())
             raise
 
     def create_embeddings(self):
-        """Create embeddings model"""
+        """Create lightweight embeddings model"""
         try:
             print("🔮 Creating embeddings model...")
             self.embeddings = HuggingFaceEmbeddings(
@@ -161,24 +164,26 @@ class UltimateRAG:
                 encode_kwargs={'normalize_embeddings': True}
             )
             
-            # Test embedding to verify dimensions
             test_embed = self.embeddings.embed_query("test")
-            print(f"✅ Embeddings model ready (dimension: {len(test_embed)})")
+            print(f"✅ Embeddings ready (dim: {len(test_embed)})")
         except Exception as e:
             print(f"❌ Error creating embeddings: {str(e)}")
-            print(traceback.format_exc())
             raise
 
     def build_and_save_index(self):
         """Build and save FAISS index"""
         try:
-            print("🏗️  Building FAISS index...")
+            print("🏗️ Building FAISS index...")
             self.vectorstore = FAISS.from_documents(self.chunks, self.embeddings)
             self.vectorstore.save_local(self.index_path)
+            
+            # Clear chunks after indexing
+            del self.chunks
+            gc.collect()
+            
             print(f"💾 FAISS index saved to {self.index_path}")
         except Exception as e:
             print(f"❌ Error building FAISS index: {str(e)}")
-            print(traceback.format_exc())
             raise
 
     def load_index(self):
@@ -191,27 +196,25 @@ class UltimateRAG:
                 allow_dangerous_deserialization=True
             )
             self.retriever = self.vectorstore.as_retriever(
-                search_kwargs={"k": 4}
+                search_kwargs={"k": 3}  # Reduced from 4
             )
             
-            # Test retrieval to verify compatibility
+            # Test retrieval
             test_docs = self.retriever.invoke("test query")
             
             print("✅ FAISS index loaded successfully")
         except Exception as e:
             print(f"❌ Error loading FAISS index: {str(e)}")
-            print(traceback.format_exc())
             raise
 
     def ask(self, question):
-        """Answer a question"""
+        """Answer a question with memory management"""
         try:
-            print(f"🤔 Processing question: {question}")
+            print(f"🤔 Processing: {question}")
             
             # Check Excel first
             found, answer = self.excel_processor.get_answer(question)
             if found:
-                print("✅ Answer found in Excel")
                 return answer
 
             # RAG pipeline
@@ -220,19 +223,18 @@ class UltimateRAG:
             print(f"📚 Found {len(docs)} relevant documents")
             
             if not docs:
-                return "I couldn't find any relevant information to answer your question. Please try rephrasing or ask something else."
+                return "I couldn't find relevant information. Please try rephrasing."
             
             context = "\n\n".join(d.page_content for d in docs)
-            print(f"📝 Context length: {len(context)} characters")
 
-            prompt = f"""You are a helpful AI assistant. Answer the question based on the context below.
+            prompt = f"""You are a helpful AI assistant. Answer based on the context below.
 
 Context:
 {context}
 
 Question: {question}
 
-Answer (be concise and accurate):"""
+Answer (be concise):"""
 
             print("🤖 Calling Groq API...")
             response = self.client.chat.completions.create(
@@ -243,11 +245,13 @@ Answer (be concise and accurate):"""
             )
 
             answer = response.choices[0].message.content.strip()
-            print(f"✅ Generated answer: {answer[:100]}...")
+            
+            # Clean up
+            del docs, context, response
+            gc.collect()
+            
             return answer
             
         except Exception as e:
-            error_msg = f"Error in ask(): {str(e)}"
-            print(f"❌ {error_msg}")
-            print(traceback.format_exc())
-            raise Exception(error_msg)
+            print(f"❌ Error: {str(e)}")
+            raise
