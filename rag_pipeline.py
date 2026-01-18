@@ -3,6 +3,7 @@ import pandas as pd
 from groq import Groq
 from typing import Tuple
 import gc
+import re
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -12,10 +13,13 @@ from langchain_core.documents import Document
 
 
 class ExcelQAProcessor:
+    """Process and search Q&A pairs from Excel sheet using NLP similarity"""
+    
     def __init__(self, excel_path):
         self.excel_path = excel_path
         self.qa_pairs = {}
-
+        self.questions_list = []
+        
     def load_qa_pairs(self):
         """Load Q&A pairs from Excel file"""
         try:
@@ -37,6 +41,7 @@ class ExcelQAProcessor:
                 answer = str(row['Answer']).strip()
                 if question and answer and question != 'nan' and answer != 'nan':
                     self.qa_pairs[question.lower()] = answer
+                    self.questions_list.append(question.lower())
 
             print(f"✅ Loaded {len(self.qa_pairs)} Q&A pairs from Excel")
             return self.qa_pairs
@@ -46,26 +51,61 @@ class ExcelQAProcessor:
             print("   Continuing with RAG-only mode...")
             return {}
 
-    def get_answer(self, question: str) -> Tuple[bool, str]:
-        """Check if question exists in Excel Q&A and return answer"""
+    def calculate_similarity(self, query: str, target: str) -> float:
+        """Calculate simple word overlap similarity (TF-IDF-like approach)"""
+        query_words = set(query.lower().split())
+        target_words = set(target.lower().split())
+        
+        if not query_words or not target_words:
+            return 0.0
+        
+        # Jaccard similarity
+        intersection = query_words.intersection(target_words)
+        union = query_words.union(target_words)
+        
+        return len(intersection) / len(union) if union else 0.0
+
+    def get_answer(self, question: str, threshold: float = 0.3) -> Tuple[bool, str]:
+        """
+        Search for answer using NLP similarity (cosine similarity approximation)
+        Returns: (found: bool, answer: str)
+        """
         if not self.qa_pairs:
             return False, ""
 
         question_lower = question.lower().strip()
 
-        # Exact match
+        # 1. Exact match
         if question_lower in self.qa_pairs:
             return True, self.qa_pairs[question_lower]
 
-        # Partial match (check if any Excel question is contained in user question)
-        for excel_question in self.qa_pairs.keys():
-            if excel_question in question_lower or question_lower in excel_question:
-                return True, self.qa_pairs[excel_question]
+        # 2. Find best match using similarity
+        best_match = None
+        best_score = 0.0
+        
+        for excel_question in self.questions_list:
+            similarity = self.calculate_similarity(question_lower, excel_question)
+            
+            if similarity > best_score:
+                best_score = similarity
+                best_match = excel_question
+        
+        # 3. Return if similarity is above threshold
+        if best_score >= threshold and best_match:
+            print(f"📊 Excel match found (similarity: {best_score:.2f})")
+            return True, self.qa_pairs[best_match]
 
         return False, ""
 
 
 class UltimateRAG:
+    """
+    Complete RAG pipeline with:
+    - Excel Q&A search using NLP similarity
+    - Vector index retrieval
+    - LLM-based completion
+    """
+    
     def __init__(self, pdf_directory="pdfs", index_path="faiss_index",
                  excel_path=None, api_key=None):
         self.pdf_directory = pdf_directory
@@ -75,13 +115,12 @@ class UltimateRAG:
         self.model_name = "llama-3.1-8b-instant"
         self.excel_processor = None
         self.excel_qa_pairs = {}
+        self.documents = []
+        self.chunks = []
 
         if excel_path and os.path.exists(excel_path):
             self.excel_processor = ExcelQAProcessor(excel_path)
 
-    # --------------------------------------------------------
-    # Load Excel Q&A Pairs
-    # --------------------------------------------------------
     def load_excel_qa(self):
         """Load pre-defined Q&A from Excel"""
         if not self.excel_processor:
@@ -96,46 +135,46 @@ class UltimateRAG:
             for i, q in enumerate(list(self.excel_qa_pairs.keys())[:3], 1):
                 print(f"  {i}. {q[:60]}...")
 
-    # --------------------------------------------------------
-    # Load Documents (PDF + TXT fallback)
-    # --------------------------------------------------------
     def load_documents(self):
+        """Load documents from PDF directory"""
         self.documents = []
         print("\n📂 Loading documents...")
 
-        # Load PDFs
-        if os.path.exists(self.pdf_directory):
-            pdf_files = [f for f in os.listdir(self.pdf_directory) if f.endswith(".pdf")]
+        if not os.path.exists(self.pdf_directory):
+            raise ValueError(f"❌ PDF directory not found: {self.pdf_directory}")
 
-            for pdf in pdf_files:
-                try:
-                    loader = PyPDFLoader(os.path.join(self.pdf_directory, pdf))
-                    docs = loader.load()
-                    docs = [d for d in docs if d.page_content.strip()]
+        pdf_files = [f for f in os.listdir(self.pdf_directory) if f.endswith(".pdf")]
+        
+        if not pdf_files:
+            raise ValueError(f"❌ No PDF files found in {self.pdf_directory}")
 
-                    if docs:
-                        self.documents.extend(docs)
-                        print(f"✓ Loaded {pdf} ({len(docs)} pages)")
-                    else:
-                        print(f"⚠️ {pdf} is empty, skipping...")
+        for pdf in pdf_files:
+            try:
+                loader = PyPDFLoader(os.path.join(self.pdf_directory, pdf))
+                docs = loader.load()
+                docs = [d for d in docs if d.page_content.strip()]
 
-                except Exception as e:
-                    print(f"⚠️ Error loading {pdf}: {e}")
+                if docs:
+                    self.documents.extend(docs)
+                    print(f"✓ Loaded {pdf} ({len(docs)} pages)")
+                else:
+                    print(f"⚠️ {pdf} is empty, skipping...")
+
+            except Exception as e:
+                print(f"⚠️ Error loading {pdf}: {e}")
 
         if not self.documents:
             raise ValueError("❌ No valid documents found. Cannot build RAG.")
 
         print(f"\n✅ Total documents loaded: {len(self.documents)}")
 
-    # --------------------------------------------------------
-    # Chunking - EXACTLY AS IN COLAB
-    # --------------------------------------------------------
     def split_documents(self):
+        """Split documents into chunks for vector indexing"""
         print("\n✂️ Splitting documents into chunks...")
 
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1600,      # ← COLAB VALUE
-            chunk_overlap=400,    # ← COLAB VALUE
+            chunk_size=1600,
+            chunk_overlap=400,
             separators=["\n\n", "\n", ". ", " ", ""]
         )
 
@@ -148,21 +187,17 @@ class UltimateRAG:
         print(f"✅ Total chunks created: {len(self.chunks)}")
         print(f"   Average chunk size: {sum(len(c.page_content) for c in self.chunks) // len(self.chunks)} chars")
 
-    # --------------------------------------------------------
-    # Embeddings - EXACTLY AS IN COLAB
-    # --------------------------------------------------------
     def create_embeddings(self):
+        """Create embeddings model for vector indexing"""
         print("\n🧮 Creating embeddings model...")
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-mpnet-base-v2",  # ← COLAB MODEL
+            model_name="sentence-transformers/all-mpnet-base-v2",
             encode_kwargs={"normalize_embeddings": True}
         )
         print("✅ Embeddings model ready")
 
-    # --------------------------------------------------------
-    # Vector Store (SAVE + LOAD)
-    # --------------------------------------------------------
     def build_and_save_index(self):
+        """Build FAISS vector index and save to disk"""
         print("\n💾 Building FAISS index...")
 
         self.vectorstore = FAISS.from_documents(
@@ -174,10 +209,15 @@ class UltimateRAG:
         print(f"✅ FAISS index saved to: {self.index_path}")
 
     def load_index(self):
+        """Load existing FAISS index from disk"""
         print("\n📦 Loading FAISS index from disk...")
 
         if not os.path.exists(self.index_path):
-            raise ValueError(f"❌ Index not found at {self.index_path}. Run build() first.")
+            print(f"⚠️ Index not found at {self.index_path}. Building new index...")
+            if not hasattr(self, 'chunks') or not self.chunks:
+                self.load_documents()
+                self.split_documents()
+            self.build_and_save_index()
 
         try:
             self.vectorstore = FAISS.load_local(
@@ -186,7 +226,6 @@ class UltimateRAG:
                 allow_dangerous_deserialization=True
             )
 
-            # ← COLAB RETRIEVAL CONFIG
             self.retriever = self.vectorstore.as_retriever(
                 search_type="mmr",
                 search_kwargs={"k": 8, "fetch_k": 16}
@@ -195,22 +234,19 @@ class UltimateRAG:
             print("✅ FAISS index loaded and retriever ready")
             
         except Exception as e:
-            print(f"⚠️ Error loading index (incompatible model): {e}")
-            print("🔄 Rebuilding FAISS index with new embeddings model...")
+            print(f"⚠️ Error loading index: {e}")
+            print("🔄 Rebuilding FAISS index...")
             
-            # Delete incompatible index
             import shutil
             if os.path.exists(self.index_path):
                 shutil.rmtree(self.index_path)
             
-            # Rebuild from scratch
-            if not hasattr(self, 'chunks'):
+            if not hasattr(self, 'chunks') or not self.chunks:
                 self.load_documents()
                 self.split_documents()
             
             self.build_and_save_index()
             
-            # Try loading again
             self.vectorstore = FAISS.load_local(
                 self.index_path,
                 self.embeddings,
@@ -222,61 +258,53 @@ class UltimateRAG:
             )
             print("✅ Index rebuilt and loaded successfully")
 
-    # --------------------------------------------------------
-    # Clean Response Function
-    # --------------------------------------------------------
-    def clean_response(self, text):
-        """Remove code artifacts and technical syntax from response"""
-        import re
-        
-        # Remove code blocks (```...```)
+    def clean_response(self, text: str) -> str:
+        """Remove code artifacts from LLM response"""
+        # Remove code blocks
         text = re.sub(r'```[\s\S]*?```', '', text)
-        
-        # Remove inline code (`...`)
         text = re.sub(r'`[^`]+`', '', text)
         
-        # Remove common programming keywords
-        keywords_to_remove = [
-            'python', 'print(', 'result', 'return', 'def ', 'import ',
-            'from ', '.py', '()', 'console.log', 'function', 'var ', 'let ', 'const '
-        ]
-        
-        for keyword in keywords_to_remove:
+        # Remove programming keywords
+        keywords = ['python', 'print(', 'def ', 'import ', 'return ', 'result']
+        for keyword in keywords:
             text = text.replace(keyword, '')
         
-        # Remove excessive newlines
+        # Clean whitespace
         text = re.sub(r'\n{3,}', '\n\n', text)
-        
-        # Clean up extra spaces
         text = ' '.join(text.split())
         
         return text.strip()
 
-    # --------------------------------------------------------
-    # Enhanced Ask Function - EXACTLY AS IN COLAB
-    # --------------------------------------------------------
-    def ask(self, question):
-        """Ask question with priority: Excel Q&A > RAG"""
+    def ask(self, question: str) -> str:
+        """
+        Process question with priority:
+        1. Excel Q&A (using NLP similarity)
+        2. Vector index retrieval + LLM completion
+        """
 
-        # 1. First check Excel Q&A
+        # Step 1: Check Excel Q&A first (using similarity matching)
         if self.excel_processor:
             found, excel_answer = self.excel_processor.get_answer(question)
             if found:
                 return f"\n\n{excel_answer}"
 
-        # 2. If not found in Excel, use RAG
+        # Step 2: Use RAG pipeline
         if not hasattr(self, 'retriever'):
-            return "❌ Error: RAG system not initialized. Please run build() first."
+            return "❌ Error: RAG system not initialized. Please contact support."
 
         try:
+            # Retrieve relevant documents
             docs = self.retriever.invoke(question)
 
             if not docs:
                 return "⚠️ No relevant information found in the knowledge base for this question."
 
+            # Combine context from top documents
             context = "\n\n".join(d.page_content for d in docs[:6])
 
-            prompt = f"""You are a helpful AI assistant. Answer the question based ONLY on the context provided below.
+            # Create prompt for LLM
+            prompt = f"""You are a helpful AI assistant specialized in Natural Language Processing (NLP). 
+Answer the question based ONLY on the context provided below.
 
 CONTEXT:
 {context}
@@ -288,14 +316,14 @@ INSTRUCTIONS:
 - Provide a clear, detailed answer in natural language
 - Use only information from the context
 - DO NOT include code snippets, function names, or technical syntax
-- Remove programming keywords like "python", "print", "result", variable names
-- Explain concepts conversationally without showing code examples
+- Explain concepts conversationally without showing code
 - If the context contains code, describe what it does in plain English
-- Be concise but comprehensive
-- Format your answer as a professional explanation
+- Be professional and comprehensive
+- If the context doesn't contain enough information, say so honestly
 
 ANSWER:"""
 
+            # Get LLM completion
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[{"role": "user", "content": prompt}],
@@ -303,38 +331,48 @@ ANSWER:"""
                 max_tokens=2048
             )
 
-            return f"\n\n{response.choices[0].message.content}"
+            answer = response.choices[0].message.content
+            cleaned_answer = self.clean_response(answer)
+
+            return f"\n\n{cleaned_answer}"
 
         except Exception as e:
-            return f"❌ Error generating response: {str(e)}"
+            print(f"❌ Error in ask(): {e}")
+            return f"⚠️ Error generating response. Please try again or rephrase your question."
 
-    # --------------------------------------------------------
-    # Build Complete Pipeline - EXACTLY AS IN COLAB
-    # --------------------------------------------------------
     def build(self):
-        """Build complete RAG pipeline with Excel integration"""
+        """Build complete RAG pipeline"""
         print("\n" + "="*80)
-        print("PHASE 2: BUILDING RAG PIPELINE WITH EXCEL INTEGRATION")
+        print("BUILDING HYBRID RAG PIPELINE")
         print("="*80)
 
         try:
             # Load Excel Q&A
             self.load_excel_qa()
 
-            # Build RAG components
+            # Build vector index
             self.load_documents()
             self.split_documents()
             self.create_embeddings()
-            self.build_and_save_index()
-            self.load_index()
+            
+            # Try to load existing index, build if doesn't exist
+            if os.path.exists(self.index_path):
+                self.load_index()
+            else:
+                self.build_and_save_index()
+                self.load_index()
 
             print("\n" + "="*80)
-            print("✅ COMPLETE RAG PIPELINE BUILT SUCCESSFULLY")
+            print("✅ PIPELINE BUILD COMPLETE")
             print("="*80)
-            print(f"   - Excel Q&A pairs: {len(self.excel_qa_pairs)}")
-            print(f"   - Document chunks: {len(self.chunks)}")
-            print(f"   - Vector index: {self.index_path}")
+            print(f"   📊 Excel Q&A pairs: {len(self.excel_qa_pairs)}")
+            print(f"   📄 Documents loaded: {len(self.documents)}")
+            print(f"   ✂️  Chunks created: {len(self.chunks)}")
+            print(f"   🗂️  Vector index: {self.index_path}")
             print("="*80)
+
+            # Clear memory
+            gc.collect()
 
         except Exception as e:
             print(f"\n❌ Error building pipeline: {e}")
